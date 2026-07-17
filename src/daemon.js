@@ -13,6 +13,7 @@ export class VramgateDaemon {
     this.reserve = Number(options.reserve ?? options.reserveMib ?? 1024);
     this.safety = Number(options.safety ?? options.safetyMib ?? 512);
     this.pollMs = Number(options.poll ?? options.pollMs ?? 2000);
+    this.idleThreshold = Number(options.idleThreshold ?? options.idleThresholdMib ?? 1536);
     this.budget = options.budget == null ? null : Number(options.budget);
     this.live = { used: 0, total: this.budget == null ? 0 : this.budget + this.reserve };
     this.queryGpu = createGpuQuery({
@@ -28,6 +29,8 @@ export class VramgateDaemon {
     this.server = null;
     this.timer = null;
     this.connections = new Set();
+    this.lastBusyAt = Date.now();
+    this.preemptNotified = new Set();
   }
 
   get granted() {
@@ -42,6 +45,24 @@ export class VramgateDaemon {
 
   get physicalLimit() {
     return this.budget == null ? this.live.total : this.budget + this.reserve;
+  }
+
+  get busy() {
+    return [...this.leases.values()].some(lease => !lease.preemptible)
+      || this.queue.some(item => !item.preemptible)
+      || this.external > this.idleThreshold;
+  }
+
+  updateBusy(now = Date.now()) {
+    if (this.busy) {
+      this.lastBusyAt = now;
+      for (const lease of this.leases.values()) {
+        if (lease.preemptible && !this.preemptNotified.has(lease.leaseId)) {
+          this.preemptNotified.add(lease.leaseId);
+          this.send(lease.connection.socket, { type: 'preempt', leaseId: lease.leaseId });
+        }
+      }
+    }
   }
 
   async start() {
@@ -67,6 +88,7 @@ export class VramgateDaemon {
 
   async poll() {
     this.live = await this.queryGpu();
+    this.updateBusy();
     this.scanQueue();
     return this.live;
   }
@@ -86,6 +108,7 @@ export class VramgateDaemon {
       this.connections.delete(socket);
       this.queue = this.queue.filter(item => item.connection !== state);
       for (const leaseId of state.leaseIds) this.leases.delete(leaseId);
+      this.updateBusy();
       this.scanQueue();
     };
     socket.on('close', cleanup);
@@ -101,7 +124,9 @@ export class VramgateDaemon {
       }
       const item = {
         requestId, mib,
-        priority: Number.isInteger(message.priority) ? message.priority : 0,
+        preemptible: message.preemptible === true,
+        idleWindowMs: Math.max(0, Number(message.idleWindowMs) || 0),
+        priority: Number.isInteger(message.priority) ? message.priority : (message.preemptible === true ? -100 : 0),
         label: String(message.label ?? ''),
         enqueuedAt: Date.now(),
         sequence: this.sequence++,
@@ -110,6 +135,7 @@ export class VramgateDaemon {
       this.queue.push(item);
       this.queue.sort((a, b) => b.priority - a.priority || a.sequence - b.sequence);
       connection.pending.add(requestId);
+      this.updateBusy();
       this.scanQueue();
       return;
     }
@@ -117,9 +143,11 @@ export class VramgateDaemon {
       const lease = this.leases.get(message.leaseId);
       if (lease?.connection === connection) {
         this.leases.delete(message.leaseId);
+        this.preemptNotified.delete(message.leaseId);
         connection.leaseIds.delete(message.leaseId);
       }
       this.send(connection.socket, { type: 'released', requestId, leaseId: message.leaseId });
+      this.updateBusy();
       this.scanQueue();
       return;
     }
@@ -127,6 +155,8 @@ export class VramgateDaemon {
       this.queue = this.queue.filter(item => !(item.connection === connection && item.requestId === message.targetRequestId));
       connection.pending.delete(message.targetRequestId);
       this.send(connection.socket, { type: 'cancelled', requestId });
+      this.updateBusy();
+      this.scanQueue();
       return;
     }
     if (message.type === 'status') {
@@ -137,6 +167,7 @@ export class VramgateDaemon {
   }
 
   scanQueue() {
+    this.updateBusy();
     while (this.queue.length) {
       const item = this.queue[0];
       if (item.connection.closed) {
@@ -144,13 +175,20 @@ export class VramgateDaemon {
         continue;
       }
       if (this.granted + this.external + item.mib + this.safety > this.physicalLimit) break;
+      if (item.preemptible && Date.now() - this.lastBusyAt < item.idleWindowMs) break;
       this.queue.shift();
       item.connection.pending.delete(item.requestId);
       const leaseId = `${process.pid}-${Date.now().toString(36)}-${(++this.leaseSequence).toString(36)}`;
-      const lease = { leaseId, mib: item.mib, label: item.label, priority: item.priority, grantedAt: Date.now(), connection: item.connection };
+      const lease = {
+        leaseId, mib: item.mib, label: item.label, priority: item.priority,
+        preemptible: item.preemptible, grantedAt: Date.now(), connection: item.connection
+      };
       this.leases.set(leaseId, lease);
       item.connection.leaseIds.add(leaseId);
-      this.send(item.connection.socket, { type: 'grant', requestId: item.requestId, leaseId, mib: item.mib });
+      this.send(item.connection.socket, {
+        type: 'grant', requestId: item.requestId, leaseId, mib: item.mib,
+        preemptible: item.preemptible
+      });
     }
   }
 
@@ -162,9 +200,13 @@ export class VramgateDaemon {
       live: { ...this.live, free: Math.max(0, this.live.total - this.live.used) },
       granted: this.granted,
       external: this.external,
+      busy: this.busy,
+      lastBusyAt: this.lastBusyAt,
+      idleThreshold: this.idleThreshold,
       leases: [...this.leases.values()].map(({ connection, ...lease }) => lease),
       queue: this.queue.map(item => ({
         mib: item.mib, priority: item.priority, label: item.label,
+        preemptible: item.preemptible, idleWindowMs: item.idleWindowMs,
         ageMs: Date.now() - item.enqueuedAt
       }))
     };

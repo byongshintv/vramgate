@@ -4,9 +4,9 @@ import { mkdtemp } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { VramgateDaemon } from '../src/daemon.js';
-import { VramgateClient } from '../src/client.js';
+import { VramBusyError, VramgateClient } from '../src/client.js';
 
-async function setup(t, { gpu = { used: 0, total: 17408 }, budget = 17408 } = {}) {
+async function setup(t, { gpu = { used: 0, total: 17408 }, budget = 17408, idleThreshold = 1536 } = {}) {
   const directory = await mkdtemp(join(tmpdir(), 'vramgate-'));
   const socket = join(directory, 'gate.sock');
   let reading = gpu;
@@ -15,6 +15,7 @@ async function setup(t, { gpu = { used: 0, total: 17408 }, budget = 17408 } = {}
     budget,
     reserve: 0,
     safety: 1024,
+    idleThreshold,
     poll: 100000,
     queryFn: async () => reading,
     logger: null
@@ -47,6 +48,51 @@ test('strict admission queues 16G until both 8G leases release', async t => {
   const leaseC = await waitingC;
   assert.equal(leaseC.mib, 16384);
   await leaseC.release();
+});
+
+test('acquire timeout is fail-closed after a successful connection', async t => {
+  const context = await setup(t, { gpu: { used: 16000, total: 17408 } });
+  const client = new VramgateClient({ socket: context.socket });
+  t.after(() => client.close());
+  await assert.rejects(
+    client.acquire(1024, { timeoutMs: 20 }),
+    error => error instanceof VramBusyError && error.code === 'VRAM_BUSY'
+  );
+});
+
+test('preemptible request waits for idle window and is then granted', async t => {
+  const context = await setup(t, { idleThreshold: 100 });
+  context.setGpu({ used: 200, total: 17408 });
+  await context.daemon.poll();
+  const client = new VramgateClient({ socket: context.socket, failOpen: false });
+  t.after(() => client.close());
+  const waiting = client.acquire(1024, { preemptible: true, idleWindowMs: 30 });
+  assert.equal(await remainsPending(waiting, 15), true);
+  context.setGpu({ used: 0, total: 17408 });
+  await context.daemon.poll();
+  assert.equal(await remainsPending(waiting, 15), true);
+  await new Promise(resolve => setTimeout(resolve, 20));
+  await context.daemon.poll();
+  const lease = await waiting;
+  assert.equal(lease.preemptible, true);
+  await lease.release();
+});
+
+test('non-preemptible waiter sends preempt to active preemptible lease', async t => {
+  const context = await setup(t, { gpu: { used: 0, total: 4096 }, budget: 4096 });
+  context.daemon.lastBusyAt = Date.now() - 1000;
+  const training = new VramgateClient({ socket: context.socket, failOpen: false });
+  const foreground = new VramgateClient({ socket: context.socket, failOpen: false });
+  t.after(() => { training.close(); foreground.close(); });
+  const lease = await training.acquire(2048, { preemptible: true, idleWindowMs: 10 });
+  const preempted = lease.preempted;
+  const waiting = foreground.acquire(2048);
+  const message = await preempted;
+  assert.equal(message.leaseId, lease.leaseId);
+  assert.equal(await remainsPending(waiting), true);
+  await lease.release();
+  const foregroundLease = await waiting;
+  await foregroundLease.release();
 });
 
 test('external usage blocks a new managed request', async t => {

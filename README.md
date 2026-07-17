@@ -13,32 +13,42 @@ node bin/vramgate status
 기본 소켓은 `${XDG_RUNTIME_DIR:-/run/user/$UID}/vramgate.sock`이다. 사용자 systemd 서비스는 `systemd/vramgate.service`를 적절한 사용자 유닛 경로에 복사한 뒤 `systemctl --user enable --now vramgate`로 실행할 수 있다.
 
 ```sh
-vramgate daemon --budget 15360 --reserve 1024 --safety 512
+vramgate daemon --budget 15360 --reserve 1024 --safety 512 --idle-threshold 1536
 vramgate run --vram 8G --label sdxl -- python worker.py
+vramgate idle-run --vram 12G --idle 5m --stop-grace 30s --label train -- python train.py
 vramgate hold --vram 8G --label gaming
 vramgate status --json
 ```
 
-`run`은 리스를 받은 뒤 명령을 실행하고 자식의 종료 코드를 그대로 전달한다. `hold`는 Ctrl-C까지 예약을 유지한다.
+`run`은 리스를 받은 뒤 명령을 실행하고 자식의 종료 코드를 그대로 전달한다. `hold`는 Ctrl-C까지 예약을 유지한다. `idle-run`은 지정 시간 동안 GPU가 유휴이면 저우선순위 작업을 실행한다. 일반 요청이 오면 자식에 SIGTERM을 보내고(기본 30초 뒤 SIGKILL) 리스를 해제한 뒤 유휴 상태를 기다려 재시작한다. 자식이 스스로 끝나면 그 종료 코드로 종료한다. 체크포인트 저장·재개는 자식 프로그램 책임이다.
 
 ## Node 클라이언트
 
 ```js
-import { VramgateClient } from 'vramgate';
+import { VramBusyError, VramgateClient } from 'vramgate';
 
 const client = new VramgateClient({ socket: process.env.VRAMGATE_SOCKET });
 await client.withLease(8 * 1024, { label: 'sdxl', priority: 0 }, async () => {
   // GPU 작업
 });
+
+const training = await client.acquire(12 * 1024, {
+  preemptible: true,
+  idleWindowMs: 5 * 60_000
+});
+training.onPreempt(() => stopTraining());
+await training.preempted; // 콜백 대신 Promise로도 대기 가능
 ```
 
-`acquire(mib, options)`, `status()`, `withLease(mib, options, fn)`를 제공하고, 획득한 리스는 `lease.release()`로 해제한다. 기본 `failOpen: true`이므로 데몬이 없으면 no-op 리스를 반환해 기존 작업을 계속한다. 강제 적용이 필요하면 `failOpen: false`를 사용한다.
+`acquire(mib, options)`, `status()`, `withLease(mib, options, fn)`를 제공한다. 연결 자체가 실패하면 기본 `failOpen: true`에 따라 no-op 리스를 반환한다. 연결 후 큐 대기는 `timeoutMs`가 없거나 0이면 무기한이고, 양수이면 만료 시 fail-open하지 않고 `VramBusyError`를 던진다. `withLease`에도 같은 정책이 적용된다.
 
 ## 아키텍처
 
 데몬은 Unix 소켓의 NDJSON 프로토콜로 요청을 받고 가중 카운팅 세마포어를 관리한다. 우선순위가 높은 요청부터, 같은 우선순위에서는 FIFO로 처리한다. 같은 연결에서 얻은 모든 리스는 그 연결이 닫힐 때 자동 해제된다.
 
-`nvidia-smi`의 실측 사용량에서 활성 관리 리스를 뺀 값을 external 사용량으로 본다. 신규 요청은 관리 리스, external 사용량, 요청 비용과 안전 마진의 합이 물리 VRAM 상한 이내일 때만 승인한다. 실행 중인 작업을 선점하거나 종료하지 않는다.
+`nvidia-smi`의 실측 사용량에서 활성 관리 리스를 뺀 값을 external 사용량으로 본다. 신규 요청은 관리 리스, external 사용량, 요청 비용과 안전 마진의 합이 물리 VRAM 상한 이내일 때만 승인한다.
+
+busy는 비선점 활성 리스나 대기 요청이 있거나 external이 `--idle-threshold`(기본 1536 MiB)를 넘을 때 참이다. 선점형 리스는 VRAM 조건과 `idleWindowMs` 동안 유휴였다는 조건을 모두 만족해야 승인된다. 이후 busy가 되면 데몬은 클라이언트에 `preempt` 이벤트만 보내고 프로세스를 직접 종료하지 않는다. `status`에는 `busy`, `lastBusyAt`, `idleThreshold`와 리스/큐의 선점형 정보가 포함된다.
 
 ## 수동 ComfyUI/게임 스트리밍 운용
 

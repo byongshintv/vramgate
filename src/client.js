@@ -2,8 +2,39 @@ import net from 'node:net';
 import { defaultSocketPath } from './daemon.js';
 import { createDecoder, encodeMessage } from './protocol.js';
 
+function preemptibleLeaseFields() {
+  let resolvePreempted;
+  const callbacks = new Set();
+  const preempted = new Promise(resolve => { resolvePreempted = resolve; });
+  return {
+    callbacks,
+    preempted,
+    trigger(message) {
+      resolvePreempted(message);
+      for (const callback of callbacks) callback(message);
+      callbacks.clear();
+    }
+  };
+}
+
 function noopLease(mib) {
-  return { leaseId: null, mib, noop: true, async release() {} };
+  const preemption = preemptibleLeaseFields();
+  return {
+    leaseId: null, mib, noop: true, preempted: preemption.preempted,
+    onPreempt(callback) {
+      preemption.callbacks.add(callback);
+      return () => preemption.callbacks.delete(callback);
+    },
+    async release() {}
+  };
+}
+
+export class VramBusyError extends Error {
+  constructor(message = 'VRAM lease acquisition timed out') {
+    super(message);
+    this.name = 'VramBusyError';
+    this.code = 'VRAM_BUSY';
+  }
 }
 
 export class VramgateClient {
@@ -13,6 +44,7 @@ export class VramgateClient {
     this.socket = null;
     this.connectPromise = null;
     this.pending = new Map();
+    this.leases = new Map();
     this.nextId = 1;
   }
 
@@ -48,6 +80,10 @@ export class VramgateClient {
   }
 
   onMessage(message) {
+    if (message.type === 'preempt') {
+      this.leases.get(message.leaseId)?.trigger(message);
+      return;
+    }
     const pending = this.pending.get(message.requestId);
     if (!pending) return;
     if (message.type === 'error') {
@@ -74,12 +110,17 @@ export class VramgateClient {
     return { requestId, response };
   }
 
-  async acquire(mib, { priority = 0, label = '', timeoutMs = 0 } = {}) {
+  async acquire(mib, { priority, label = '', timeoutMs = 0, preemptible = false, idleWindowMs = 0 } = {}) {
     mib = Number(mib);
     if (!Number.isInteger(mib) || mib <= 0) throw new TypeError('mib must be a positive integer');
+    priority = priority == null ? (preemptible ? -100 : 0) : Number(priority);
     let operation;
     try {
-      operation = await this.request({ type: 'acquire', mib, priority, label, timeoutMs }, ['grant']);
+      operation = await this.request({
+        type: 'acquire', mib, priority, label,
+        preemptible: Boolean(preemptible),
+        idleWindowMs: Number(idleWindowMs)
+      }, ['grant']);
     } catch (error) {
       if (this.failOpen) return noopLease(mib);
       throw error;
@@ -90,22 +131,35 @@ export class VramgateClient {
         ? await Promise.race([
             operation.response,
             new Promise((_, reject) => {
-              timer = setTimeout(() => reject(new Error(`acquire timed out after ${timeoutMs}ms`)), timeoutMs);
+              timer = setTimeout(
+                () => reject(new VramBusyError(`VRAM lease acquisition timed out after ${timeoutMs}ms`)),
+                timeoutMs
+              );
             })
           ])
         : await operation.response;
+      const preemption = preemptibleLeaseFields();
       const lease = {
         leaseId: message.leaseId,
         mib: message.mib,
         noop: false,
+        preemptible: Boolean(message.preemptible),
+        preempted: preemption.preempted,
+        onPreempt(callback) {
+          preemption.callbacks.add(callback);
+          return () => preemption.callbacks.delete(callback);
+        },
         release: async () => {
           if (!lease.leaseId) return;
           const leaseId = lease.leaseId;
           lease.leaseId = null;
+          this.leases.delete(leaseId);
           const { response } = await this.request({ type: 'release', leaseId }, ['released']);
           await response;
         }
       };
+      preemption.trigger = preemption.trigger.bind(preemption);
+      this.leases.set(lease.leaseId, preemption);
       return lease;
     } catch (error) {
       this.pending.delete(operation.requestId);

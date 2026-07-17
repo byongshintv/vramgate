@@ -2,11 +2,12 @@
 import { spawn } from 'node:child_process';
 import { VramgateDaemon, defaultSocketPath } from '../src/daemon.js';
 import { VramgateClient } from '../src/client.js';
-import { parseMib } from '../src/units.js';
+import { parseDurationMs, parseMib } from '../src/units.js';
 
 const HELP = `Usage:
-  vramgate daemon [--budget MIB] [--reserve MIB] [--safety MIB] [--socket PATH] [--gpu N] [--poll MS]
+  vramgate daemon [--budget MIB] [--reserve MIB] [--safety MIB] [--idle-threshold MIB] [--socket PATH] [--gpu N] [--poll MS]
   vramgate run --vram SIZE [--priority N] [--label L] [--wait-timeout S] -- <command...>
+  vramgate idle-run --vram SIZE --idle DURATION [--priority -100] [--stop-grace 30s] [--label L] [--socket PATH] -- <command...>
   vramgate hold --vram SIZE [--priority N] [--label L] [--wait-timeout S]
   vramgate status [--json] [--socket PATH]`;
 
@@ -42,6 +43,7 @@ async function daemonCommand(options) {
     budget: options.budget == null ? undefined : parseMib(options.budget),
     reserve: options.reserve == null ? undefined : parseMib(options.reserve),
     safety: options.safety == null ? undefined : parseMib(options.safety),
+    idleThreshold: options['idle-threshold'] == null ? undefined : parseMib(options['idle-threshold']),
     gpu: options.gpu == null ? undefined : Number(options.gpu),
     poll: options.poll == null ? undefined : Number(options.poll)
   });
@@ -91,6 +93,87 @@ async function runCommand(options, command) {
   }
 }
 
+function waitForChild(child) {
+  return new Promise((resolve, reject) => {
+    child.once('error', reject);
+    child.once('exit', (code, signal) => resolve({ code, signal }));
+  });
+}
+
+async function terminateChild(child, graceMs) {
+  if (child.exitCode != null || child.signalCode != null) return;
+  child.kill('SIGTERM');
+  let timer;
+  await Promise.race([
+    new Promise(resolve => child.once('exit', resolve)),
+    new Promise(resolve => { timer = setTimeout(resolve, graceMs); })
+  ]);
+  clearTimeout(timer);
+  if (child.exitCode == null && child.signalCode == null) {
+    child.kill('SIGKILL');
+    await new Promise(resolve => child.once('exit', resolve));
+  }
+}
+
+async function idleRunCommand(options, command) {
+  if (!command.length) throw new Error('a command is required after --');
+  if (options.vram == null) throw new Error('--vram is required');
+  if (options.idle == null) throw new Error('--idle is required');
+  const mib = parseMib(options.vram);
+  const idleWindowMs = parseDurationMs(options.idle);
+  const graceMs = parseDurationMs(options['stop-grace'] ?? '30s');
+  const client = new VramgateClient({ socket: socketOption(options) });
+  let interrupted = false;
+  let child = null;
+  process.once('SIGINT', () => {
+    interrupted = true;
+    if (child) void terminateChild(child, graceMs);
+    else client.close();
+  });
+
+  try {
+    while (!interrupted) {
+      let lease;
+      try {
+        lease = await client.acquire(mib, {
+          preemptible: true,
+          idleWindowMs,
+          priority: Number(options.priority ?? -100),
+          label: options.label ?? 'train'
+        });
+      } catch (error) {
+        if (interrupted) break;
+        throw error;
+      }
+      if (interrupted) {
+        await lease.release();
+        break;
+      }
+      child = spawn(command[0], command.slice(1), { stdio: 'inherit' });
+      const exited = waitForChild(child);
+      const outcome = await Promise.race([
+        exited.then(result => ({ type: 'exit', result })),
+        lease.preempted.then(() => ({ type: 'preempt' }))
+      ]);
+      if (outcome.type === 'preempt' || interrupted) {
+        await terminateChild(child, graceMs);
+        await exited;
+        child = null;
+        await lease.release();
+        continue;
+      }
+      child = null;
+      await lease.release();
+      if (outcome.result.signal) process.kill(process.pid, outcome.result.signal);
+      else process.exitCode = outcome.result.code ?? 1;
+      return;
+    }
+  } finally {
+    if (child) await terminateChild(child, graceMs);
+    client.close();
+  }
+}
+
 async function holdCommand(options) {
   const { mib, opts } = acquireOptions(options);
   const client = new VramgateClient({ socket: socketOption(options) });
@@ -106,12 +189,13 @@ function printStatus(status) {
   console.log(`  budget ${status.budget} MiB  reserve ${status.reserve} MiB  safety ${status.safety} MiB`);
   console.log(`  used ${status.live.used} MiB  free ${status.live.free} MiB  total ${status.live.total} MiB`);
   console.log(`  managed ${status.granted} MiB  external ${status.external} MiB`);
+  console.log(`  busy ${status.busy}  last busy ${new Date(status.lastBusyAt).toISOString()}  idle threshold ${status.idleThreshold} MiB`);
   console.log('\nACTIVE LEASES');
-  console.log('ID\tMIB\tLABEL');
-  for (const lease of status.leases) console.log(`${lease.leaseId}\t${lease.mib}\t${lease.label || '-'}`);
+  console.log('ID\tMIB\tPREEMPTIBLE\tLABEL');
+  for (const lease of status.leases) console.log(`${lease.leaseId}\t${lease.mib}\t${lease.preemptible}\t${lease.label || '-'}`);
   console.log('\nWAITING');
-  console.log('MIB\tPRIORITY\tAGE\tLABEL');
-  for (const item of status.queue) console.log(`${item.mib}\t${item.priority}\t${Math.round(item.ageMs / 1000)}s\t${item.label || '-'}`);
+  console.log('MIB\tPRIORITY\tPREEMPTIBLE\tAGE\tLABEL');
+  for (const item of status.queue) console.log(`${item.mib}\t${item.priority}\t${item.preemptible}\t${Math.round(item.ageMs / 1000)}s\t${item.label || '-'}`);
 }
 
 async function statusCommand(options) {
@@ -138,6 +222,7 @@ async function main() {
   }
   if (command === 'daemon') return daemonCommand(options);
   if (command === 'run') return runCommand(options, positionals);
+  if (command === 'idle-run') return idleRunCommand(options, positionals);
   if (command === 'hold') return holdCommand(options);
   if (command === 'status') return statusCommand(options);
   throw new Error(`unknown command: ${command}`);
