@@ -1,0 +1,12 @@
+[Unit]
+Description=Cooperative VRAM admission-control broker
+
+[Service]
+Type=simple
+WorkingDirectory=%h/projects/vramgate
+ExecStart=/usr/bin/env node %h/projects/vramgate/bin/vramgate daemon --socket ${XDG_RUNTIME_DIR}/vramgate.sock
+Restart=on-failure
+Environment=NODE_ENV=production
+
+[Install]
+WantedBy=default.target

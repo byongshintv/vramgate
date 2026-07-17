@@ -1,0 +1,23 @@
+{
+  "name": "vramgate",
+  "version": "1.0.0",
+  "description": "Cooperative VRAM admission-control broker",
+  "type": "module",
+  "bin": {
+    "vramgate": "./bin/vramgate"
+  },
+  "exports": {
+    ".": "./src/client.js",
+    "./client": "./src/client.js",
+    "./daemon": "./src/daemon.js",
+    "./gpu": "./src/gpu.js",
+    "./units": "./src/units.js"
+  },
+  "scripts": {
+    "test": "node --test"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "license": "MIT"
+}

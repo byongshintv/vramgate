@@ -1,0 +1,149 @@
+#!/usr/bin/env node
+import { spawn } from 'node:child_process';
+import { VramgateDaemon, defaultSocketPath } from '../src/daemon.js';
+import { VramgateClient } from '../src/client.js';
+import { parseMib } from '../src/units.js';
+
+const HELP = `Usage:
+  vramgate daemon [--budget MIB] [--reserve MIB] [--safety MIB] [--socket PATH] [--gpu N] [--poll MS]
+  vramgate run --vram SIZE [--priority N] [--label L] [--wait-timeout S] -- <command...>
+  vramgate hold --vram SIZE [--priority N] [--label L] [--wait-timeout S]
+  vramgate status [--json] [--socket PATH]`;
+
+function parseArgs(args) {
+  const options = {};
+  const positionals = [];
+  for (let i = 0; i < args.length; i++) {
+    const arg = args[i];
+    if (arg === '--') {
+      positionals.push(...args.slice(i + 1));
+      break;
+    }
+    if (arg.startsWith('--')) {
+      const [rawKey, inline] = arg.slice(2).split('=', 2);
+      if (rawKey === 'json' || rawKey === 'help') options[rawKey] = true;
+      else {
+        const value = inline ?? args[++i];
+        if (value == null) throw new Error(`--${rawKey} requires a value`);
+        options[rawKey] = value;
+      }
+    } else positionals.push(arg);
+  }
+  return { options, positionals };
+}
+
+function socketOption(options) {
+  return options.socket ?? process.env.VRAMGATE_SOCKET ?? defaultSocketPath();
+}
+
+async function daemonCommand(options) {
+  const daemon = new VramgateDaemon({
+    socket: socketOption(options),
+    budget: options.budget == null ? undefined : parseMib(options.budget),
+    reserve: options.reserve == null ? undefined : parseMib(options.reserve),
+    safety: options.safety == null ? undefined : parseMib(options.safety),
+    gpu: options.gpu == null ? undefined : Number(options.gpu),
+    poll: options.poll == null ? undefined : Number(options.poll)
+  });
+  await daemon.start();
+  console.log(`vramgate daemon listening on ${daemon.socket}`);
+  const stop = async () => {
+    await daemon.close();
+    process.exit(0);
+  };
+  process.once('SIGINT', stop);
+  process.once('SIGTERM', stop);
+}
+
+function acquireOptions(options) {
+  if (options.vram == null) throw new Error('--vram is required');
+  return {
+    mib: parseMib(options.vram),
+    opts: {
+      priority: Number(options.priority ?? 0),
+      label: options.label ?? '',
+      timeoutMs: Number(options['wait-timeout'] ?? 0) * 1000
+    }
+  };
+}
+
+async function runCommand(options, command) {
+  if (!command.length) throw new Error('a command is required after --');
+  const { mib, opts } = acquireOptions(options);
+  const client = new VramgateClient({ socket: socketOption(options) });
+  const lease = await client.acquire(mib, opts);
+  const child = spawn(command[0], command.slice(1), { stdio: 'inherit' });
+  const forward = signal => {
+    if (!child.killed) child.kill(signal);
+  };
+  process.on('SIGINT', forward);
+  process.on('SIGTERM', forward);
+  const result = await new Promise((resolve, reject) => {
+    child.once('error', reject);
+    child.once('exit', (code, signal) => resolve({ code, signal }));
+  });
+  await lease.release();
+  client.close();
+  if (result.signal) {
+    process.kill(process.pid, result.signal);
+  } else {
+    process.exitCode = result.code ?? 1;
+  }
+}
+
+async function holdCommand(options) {
+  const { mib, opts } = acquireOptions(options);
+  const client = new VramgateClient({ socket: socketOption(options) });
+  const lease = await client.acquire(mib, opts);
+  console.log(`Holding ${mib} MiB${lease.noop ? ' (daemon unavailable; fail-open)' : ` (lease ${lease.leaseId})`}. Press Ctrl-C to release.`);
+  await new Promise(resolve => process.once('SIGINT', resolve));
+  await lease.release();
+  client.close();
+}
+
+function printStatus(status) {
+  console.log('VRAM');
+  console.log(`  budget ${status.budget} MiB  reserve ${status.reserve} MiB  safety ${status.safety} MiB`);
+  console.log(`  used ${status.live.used} MiB  free ${status.live.free} MiB  total ${status.live.total} MiB`);
+  console.log(`  managed ${status.granted} MiB  external ${status.external} MiB`);
+  console.log('\nACTIVE LEASES');
+  console.log('ID\tMIB\tLABEL');
+  for (const lease of status.leases) console.log(`${lease.leaseId}\t${lease.mib}\t${lease.label || '-'}`);
+  console.log('\nWAITING');
+  console.log('MIB\tPRIORITY\tAGE\tLABEL');
+  for (const item of status.queue) console.log(`${item.mib}\t${item.priority}\t${Math.round(item.ageMs / 1000)}s\t${item.label || '-'}`);
+}
+
+async function statusCommand(options) {
+  const client = new VramgateClient({ socket: socketOption(options), failOpen: false });
+  try {
+    const status = await client.status();
+    if (options.json) console.log(JSON.stringify(status, null, 2));
+    else printStatus(status);
+  } finally {
+    client.close();
+  }
+}
+
+async function main() {
+  const [command, ...args] = process.argv.slice(2);
+  if (!command || command === '--help' || command === '-h') {
+    console.log(HELP);
+    return;
+  }
+  const { options, positionals } = parseArgs(args);
+  if (options.help) {
+    console.log(HELP);
+    return;
+  }
+  if (command === 'daemon') return daemonCommand(options);
+  if (command === 'run') return runCommand(options, positionals);
+  if (command === 'hold') return holdCommand(options);
+  if (command === 'status') return statusCommand(options);
+  throw new Error(`unknown command: ${command}`);
+}
+
+main().catch(error => {
+  console.error(`vramgate: ${error.message}`);
+  process.exitCode = 1;
+});
