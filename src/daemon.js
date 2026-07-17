@@ -125,6 +125,7 @@ export class VramgateDaemon {
       const item = {
         requestId, mib,
         preemptible: message.preemptible === true,
+        adopt: message.adopt === true,
         idleWindowMs: Math.max(0, Number(message.idleWindowMs) || 0),
         priority: Number.isInteger(message.priority) ? message.priority : (message.preemptible === true ? -100 : 0),
         label: String(message.label ?? ''),
@@ -132,6 +133,22 @@ export class VramgateDaemon {
         sequence: this.sequence++,
         connection
       };
+      if (item.adopt) {
+        const leaseId = `${process.pid}-${Date.now().toString(36)}-${(++this.leaseSequence).toString(36)}`;
+        const lease = {
+          leaseId, mib: item.mib, label: item.label, priority: item.priority,
+          preemptible: item.preemptible, adopt: true, grantedAt: Date.now(), connection
+        };
+        this.leases.set(leaseId, lease);
+        connection.leaseIds.add(leaseId);
+        this.send(connection.socket, {
+          type: 'grant', requestId, leaseId, mib: item.mib,
+          preemptible: item.preemptible
+        });
+        this.updateBusy();
+        this.scanQueue();
+        return;
+      }
       this.queue.push(item);
       this.queue.sort((a, b) => b.priority - a.priority || a.sequence - b.sequence);
       connection.pending.add(requestId);

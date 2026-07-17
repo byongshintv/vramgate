@@ -10,6 +10,7 @@
     ".": "./src/client.js",
     "./client": "./src/client.js",
     "./daemon": "./src/daemon.js",
+    "./custodian": "./src/custodian.js",
     "./gpu": "./src/gpu.js",
     "./units": "./src/units.js"
   },

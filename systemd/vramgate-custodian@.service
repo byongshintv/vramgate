@@ -1,0 +1,14 @@
+[Unit]
+Description=vramgate custodian (%i)
+After=vramgate.service
+Wants=vramgate.service
+
+[Service]
+Type=simple
+WorkingDirectory=%h/projects/vramgate
+ExecStart=/usr/bin/env node %h/projects/vramgate/bin/vramgate custodian --backend %i --socket /run/user/1000/vramgate.sock
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=default.target

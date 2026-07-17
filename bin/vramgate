@@ -2,12 +2,14 @@
 import { spawn } from 'node:child_process';
 import { VramgateDaemon, defaultSocketPath } from '../src/daemon.js';
 import { VramgateClient } from '../src/client.js';
+import { BACKENDS, runCustodian } from '../src/custodian.js';
 import { parseDurationMs, parseMib } from '../src/units.js';
 
 const HELP = `Usage:
   vramgate daemon [--budget MIB] [--reserve MIB] [--safety MIB] [--idle-threshold MIB] [--socket PATH] [--gpu N] [--poll MS]
   vramgate run --vram SIZE [--priority N] [--label L] [--wait-timeout S] -- <command...>
   vramgate idle-run --vram SIZE --idle DURATION [--priority -100] [--stop-grace 30s] [--label L] [--socket PATH] -- <command...>
+  vramgate custodian --backend ollama|comfyui [--socket PATH] [--poll MS] [--min-mib N] [--priority -1000]
   vramgate hold --vram SIZE [--priority N] [--label L] [--wait-timeout S]
   vramgate status [--json] [--socket PATH]`;
 
@@ -209,6 +211,20 @@ async function statusCommand(options) {
   }
 }
 
+async function custodianCommand(options) {
+  if (options.backend == null) throw new Error('--backend is required');
+  if (!Object.hasOwn(BACKENDS, options.backend)) {
+    throw new Error(`unsupported custodian backend: ${options.backend}`);
+  }
+  return runCustodian({
+    backend: options.backend,
+    socket: socketOption(options),
+    pollMs: options.poll == null ? undefined : Number(options.poll),
+    minMib: options['min-mib'] == null ? undefined : parseMib(options['min-mib']),
+    priority: options.priority == null ? undefined : Number(options.priority)
+  });
+}
+
 async function main() {
   const [command, ...args] = process.argv.slice(2);
   if (!command || command === '--help' || command === '-h') {
@@ -223,6 +239,7 @@ async function main() {
   if (command === 'daemon') return daemonCommand(options);
   if (command === 'run') return runCommand(options, positionals);
   if (command === 'idle-run') return idleRunCommand(options, positionals);
+  if (command === 'custodian') return custodianCommand(options);
   if (command === 'hold') return holdCommand(options);
   if (command === 'status') return statusCommand(options);
   throw new Error(`unknown command: ${command}`);

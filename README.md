@@ -65,6 +65,12 @@ vramgate run --vram 8G --label game-stream -- ./start-game.sh
 
 - TODO: strict priority/FIFO의 head-of-line blocking을 완화하는 안전한 backfill 정책.
 
+## Custodian
+
+Custodian은 Ollama 또는 ComfyUI의 상주 idle 모델 VRAM을 선점 가능한 캐시 리스로 등록하고, 다른 작업이 공간을 요구하면 모델을 언로드해 VRAM을 회수한다.
+`systemctl --user enable --now vramgate-custodian@ollama` 또는
+`systemctl --user enable --now vramgate-custodian@comfyui`로 백엔드별 서비스를 활성화할 수 있다.
+
 ## 테스트
 
 ```sh

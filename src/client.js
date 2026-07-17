@@ -110,7 +110,7 @@ export class VramgateClient {
     return { requestId, response };
   }
 
-  async acquire(mib, { priority, label = '', timeoutMs = 0, preemptible = false, idleWindowMs = 0 } = {}) {
+  async acquire(mib, { priority, label = '', timeoutMs = 0, preemptible = false, adopt = false, idleWindowMs = 0 } = {}) {
     mib = Number(mib);
     if (!Number.isInteger(mib) || mib <= 0) throw new TypeError('mib must be a positive integer');
     priority = priority == null ? (preemptible ? -100 : 0) : Number(priority);
@@ -119,6 +119,7 @@ export class VramgateClient {
       operation = await this.request({
         type: 'acquire', mib, priority, label,
         preemptible: Boolean(preemptible),
+        adopt: Boolean(adopt),
         idleWindowMs: Number(idleWindowMs)
       }, ['grant']);
     } catch (error) {
