@@ -6,6 +6,9 @@ Wants=vramgate.service
 [Service]
 Type=simple
 WorkingDirectory=%h/projects/vramgate
+# comfyui 인스턴스의 GPU 프로세스 매칭용(실행 cmdline이 .../comfyui/venv/bin/python main.py).
+# ollama 인스턴스는 이 값을 읽지 않으므로 무해하다.
+Environment=VRAMGATE_COMFYUI_PROC_MATCH=comfyui/venv
 ExecStart=/usr/bin/env node %h/projects/vramgate/bin/vramgate custodian --backend %i --socket /run/user/1000/vramgate.sock
 Restart=on-failure
 RestartSec=3
