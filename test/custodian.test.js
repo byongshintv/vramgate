@@ -4,7 +4,7 @@ import { mkdtemp } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { VramgateClient } from '../src/client.js';
-import { createCustodian } from '../src/custodian.js';
+import { BACKENDS, createCustodian, fetchWithRetry } from '../src/custodian.js';
 import { VramgateDaemon } from '../src/daemon.js';
 
 async function setup(t) {
@@ -122,5 +122,95 @@ test('same-backend demand yields the cache lease without unloading models', asyn
 
   assert.equal(context.unloads, 0);
   assert.equal(context.custodian.lease, null);
+  await lease.release();
+});
+
+test('fetchWithRetry succeeds after two transient failures', async t => {
+  const originalFetch = globalThis.fetch;
+  t.after(() => { globalThis.fetch = originalFetch; });
+  let attempts = 0;
+  globalThis.fetch = async () => {
+    attempts++;
+    if (attempts < 3) throw new Error('fetch failed');
+    return { ok: true };
+  };
+
+  const response = await fetchWithRetry('http://example.test', undefined, {
+    retries: 3,
+    backoffMs: 0,
+    logger: null
+  });
+
+  assert.equal(response.ok, true);
+  assert.equal(attempts, 3);
+});
+
+test('fetchWithRetry throws after all attempts fail', async t => {
+  const originalFetch = globalThis.fetch;
+  t.after(() => { globalThis.fetch = originalFetch; });
+  let attempts = 0;
+  globalThis.fetch = async () => {
+    attempts++;
+    throw new Error('fetch failed');
+  };
+
+  await assert.rejects(fetchWithRetry('http://example.test', undefined, {
+    retries: 3,
+    backoffMs: 0,
+    logger: null
+  }), /fetch failed/);
+  assert.equal(attempts, 3);
+});
+
+test('cache lease release requires consecutive below-minimum confirmations', async t => {
+  const context = await setup(t);
+  let resident = 2048;
+  context.adapter.queryResidentMib = async () => resident;
+  await context.custodian.ensureLease();
+
+  resident = 0;
+  await context.custodian.tick();
+  assert.notEqual(context.custodian.lease, null);
+
+  resident = 2048;
+  await context.custodian.tick();
+  resident = 0;
+  await context.custodian.tick();
+  assert.notEqual(context.custodian.lease, null);
+
+  await context.custodian.tick();
+  assert.equal(context.custodian.lease, null);
+  assert.equal(context.daemon.status().leases.length, 0);
+});
+
+test('ollama labels default to llm and vlm and can be replaced from env', t => {
+  const previous = process.env.VRAMGATE_OLLAMA_LABELS;
+  t.after(() => {
+    if (previous === undefined) delete process.env.VRAMGATE_OLLAMA_LABELS;
+    else process.env.VRAMGATE_OLLAMA_LABELS = previous;
+  });
+
+  delete process.env.VRAMGATE_OLLAMA_LABELS;
+  assert.deepEqual(BACKENDS.ollama({ logger: null }).sameBackendLabels, new Set(['llm', 'vlm']));
+
+  process.env.VRAMGATE_OLLAMA_LABELS = ' llm, embed, ,custom ';
+  assert.deepEqual(
+    BACKENDS.ollama({ logger: null }).sameBackendLabels,
+    new Set(['llm', 'embed', 'custom'])
+  );
+});
+
+test('active vlm demand prevents ollama model unload on preemption', async t => {
+  const context = await setup(t);
+  context.adapter.sameBackendLabels = new Set(['llm', 'vlm']);
+  await context.custodian.ensureLease();
+  const vlm = new VramgateClient({ socket: context.socket, failOpen: false });
+  t.after(() => vlm.close());
+
+  const waiting = vlm.acquire(3072, { label: 'vlm' });
+  await waitFor(() => context.custodian.lease === null);
+  const lease = await waiting;
+
+  assert.equal(context.unloads, 0);
   await lease.release();
 });
