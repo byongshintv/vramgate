@@ -118,3 +118,45 @@ test('closing a connection releases all of its leases and rescans', async t => {
   assert.equal(lease.mib, 16 * 1024);
   await lease.release();
 });
+
+test('GPU query failures block new grants after the configured threshold and recover', async t => {
+  const context = await setup(t);
+  context.daemon.gpuFailureLimit = 2;
+  context.setGpu(Promise.reject(new Error('driver offline')));
+  await context.daemon.poll();
+  assert.equal(context.daemon.status().admissionBlocked, false);
+  await context.daemon.poll();
+  assert.equal(context.daemon.status().admissionBlocked, true);
+
+  const client = new VramgateClient({ socket: context.socket, failOpen: false });
+  t.after(() => client.close());
+  const waiting = client.acquire(1024, { label: 'blocked-during-driver-failure' });
+  assert.equal(await remainsPending(waiting), true);
+
+  context.setGpu({ used: 0, total: 17408 });
+  await context.daemon.poll();
+  const lease = await waiting;
+  assert.equal(context.daemon.status().admissionBlocked, false);
+  await lease.release();
+});
+
+test('audit logger records queue, grant, release, and connection cleanup', async t => {
+  const lines = [];
+  const directory = await mkdtemp(join(tmpdir(), 'vramgate-audit-'));
+  const socket = join(directory, 'gate.sock');
+  const daemon = new VramgateDaemon({
+    socket, budget: 4096, reserve: 0, safety: 0, poll: 100000,
+    queryFn: async () => ({ used: 0, total: 4096 }),
+    logger: { info: line => lines.push(line), warn() {} }
+  });
+  await daemon.start();
+  t.after(async () => daemon.close());
+  const client = new VramgateClient({ socket, failOpen: false });
+  const lease = await client.acquire(1024, { label: 'audit-test' });
+  await lease.release();
+  client.close();
+  assert.ok(lines.some(line => line.includes('"event":"queue"')));
+  assert.ok(lines.some(line => line.includes('"event":"grant"')));
+  assert.ok(lines.some(line => line.includes('"event":"release"')));
+  assert.ok(lines.every(line => line.startsWith('vramgate:audit ')));
+});

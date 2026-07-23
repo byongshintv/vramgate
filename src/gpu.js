@@ -19,6 +19,7 @@ function systemQuery(index) {
 
 export function createGpuQuery({ index = 0, queryFn = systemQuery, totalMib = 0, logger = console } = {}) {
   let cached;
+  let consecutiveFailures = 0;
   return async function queryGpu() {
     try {
       const value = await queryFn(index);
@@ -29,10 +30,19 @@ export function createGpuQuery({ index = 0, queryFn = systemQuery, totalMib = 0,
         throw new Error('GPU query returned invalid values');
       }
       cached = { used: Math.max(0, Math.round(result.used)), total: Math.max(0, Math.round(result.total)) };
-      return cached;
+      consecutiveFailures = 0;
+      return { ...cached, queryHealthy: true, consecutiveFailures: 0, hasSuccessfulReading: true };
     } catch (error) {
-      logger?.warn?.(`vramgate: GPU query failed, using cached/bookkeeping values: ${error.message}`);
-      return cached ?? { used: 0, total: Math.max(0, Math.round(totalMib)) };
+      consecutiveFailures += 1;
+      if (consecutiveFailures === 1) {
+        logger?.warn?.(`vramgate: GPU query failed, using cached/bookkeeping values: ${error.message}`);
+      }
+      return {
+        ...(cached ?? { used: 0, total: Math.max(0, Math.round(totalMib)) }),
+        queryHealthy: false,
+        consecutiveFailures,
+        hasSuccessfulReading: cached != null
+      };
     }
   };
 }

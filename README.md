@@ -48,7 +48,19 @@ await training.preempted; // 콜백 대신 Promise로도 대기 가능
 
 `nvidia-smi`의 실측 사용량에서 활성 관리 리스를 뺀 값을 external 사용량으로 본다. 신규 요청은 관리 리스, external 사용량, 요청 비용과 안전 마진의 합이 물리 VRAM 상한 이내일 때만 승인한다.
 
+GPU 조회는 마지막 정상 실측값을 짧게 재사용하되 기본 3회 연속 실패하면 신규 리스 승인을 중단한다. 정상 실측이 돌아오면 대기열 처리를 자동 재개한다. 임계값은 `--gpu-failure-limit` 또는 `VRAMGATE_GPU_FAILURE_LIMIT`로 바꿀 수 있다. 정상 실측을 한 번도 얻지 못한 시작 상태에서는 즉시 승인을 차단한다.
+
 busy는 비선점 활성 리스나 대기 요청이 있거나 external이 `--idle-threshold`(기본 1536 MiB)를 넘을 때 참이다. 선점형 리스는 VRAM 조건과 `idleWindowMs` 동안 유휴였다는 조건을 모두 만족해야 승인된다. 이후 busy가 되면 데몬은 클라이언트에 `preempt` 이벤트만 보내고 프로세스를 직접 종료하지 않는다. `status`에는 `busy`, `lastBusyAt`, `idleThreshold`와 리스/큐의 선점형 정보가 포함된다.
+
+## 운영 감사 로그
+
+데몬은 `queue`, `grant`, `release`, `cancel`, `preempt`, GPU 조회 차단·복구 이벤트를 `vramgate:audit` 접두사의 한 줄 JSON으로 표준 출력에 기록한다. systemd 환경에서는 다음처럼 조회할 수 있다.
+
+```sh
+journalctl --user -u vramgate -g 'vramgate:audit'
+```
+
+리스 로그에는 label·MiB·우선순위·대기시간·보유시간·해제 사유가 포함되므로 작동 횟수와 병목을 사후 집계할 수 있다.
 
 ## 수동 ComfyUI/게임 스트리밍 운용
 

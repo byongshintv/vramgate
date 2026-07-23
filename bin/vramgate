@@ -6,7 +6,7 @@ import { BACKENDS, runCustodian } from '../src/custodian.js';
 import { parseDurationMs, parseMib } from '../src/units.js';
 
 const HELP = `Usage:
-  vramgate daemon [--budget MIB] [--reserve MIB] [--safety MIB] [--idle-threshold MIB] [--socket PATH] [--gpu N] [--poll MS]
+  vramgate daemon [--budget MIB] [--reserve MIB] [--safety MIB] [--idle-threshold MIB] [--gpu-failure-limit N] [--socket PATH] [--gpu N] [--poll MS]
   vramgate run --vram SIZE [--priority N] [--label L] [--wait-timeout S] -- <command...>
   vramgate idle-run --vram SIZE --idle DURATION [--priority -100] [--stop-grace 30s] [--label L] [--socket PATH] -- <command...>
   vramgate custodian --backend ollama|comfyui [--socket PATH] [--poll MS] [--min-mib N] [--priority -1000]
@@ -46,6 +46,9 @@ async function daemonCommand(options) {
     reserve: options.reserve == null ? undefined : parseMib(options.reserve),
     safety: options.safety == null ? undefined : parseMib(options.safety),
     idleThreshold: options['idle-threshold'] == null ? undefined : parseMib(options['idle-threshold']),
+    gpuFailureLimit: options['gpu-failure-limit'] == null
+      ? Number(process.env.VRAMGATE_GPU_FAILURE_LIMIT ?? 3)
+      : Number(options['gpu-failure-limit']),
     gpu: options.gpu == null ? undefined : Number(options.gpu),
     poll: options.poll == null ? undefined : Number(options.poll)
   });

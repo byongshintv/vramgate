@@ -13,8 +13,14 @@ test('GPU query supports injection and caches the last successful value', async 
     index: 2,
     logger: null
   });
-  assert.deepEqual(await query(), { used: 1234, total: 16384 });
-  assert.deepEqual(await query(), { used: 1234, total: 16384 });
+  assert.deepEqual(await query(), {
+    used: 1234, total: 16384, queryHealthy: true,
+    consecutiveFailures: 0, hasSuccessfulReading: true
+  });
+  assert.deepEqual(await query(), {
+    used: 1234, total: 16384, queryHealthy: false,
+    consecutiveFailures: 1, hasSuccessfulReading: true
+  });
 });
 
 test('GPU query falls back to configured total before first success', async () => {
@@ -23,5 +29,8 @@ test('GPU query falls back to configured total before first success', async () =
     totalMib: 24576,
     logger: null
   });
-  assert.deepEqual(await query(), { used: 0, total: 24576 });
+  assert.deepEqual(await query(), {
+    used: 0, total: 24576, queryHealthy: false,
+    consecutiveFailures: 1, hasSuccessfulReading: false
+  });
 });
