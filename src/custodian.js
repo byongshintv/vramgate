@@ -70,6 +70,22 @@ function createOllamaBackend({ logger = console } = {}) {
     : configuredLabels.split(',').map(label => label.trim()).filter(Boolean);
   return {
     sameBackendLabels: new Set(labels),
+    async shouldUnload(status) {
+      const demand = [...status.leases, ...status.queue]
+        .filter(item => item.preemptible === false)
+        .map(item => item.label)
+        .filter(label => label.startsWith('ollama:model:'));
+      if (!demand.length) return !hasActiveSameBackend(status, this.sameBackendLabels);
+      const resident = await ollamaModels(baseUrl, { retries, logger });
+      const residentNames = new Set(resident.flatMap(model => {
+        const name = model.name ?? model.model ?? '';
+        return [name, name.replace(/:latest$/, '')];
+      }));
+      return demand.some(label => {
+        const requested = label.slice('ollama:model:'.length);
+        return !residentNames.has(requested) && !residentNames.has(requested.replace(/:latest$/, ''));
+      });
+    },
     async queryResidentMib() {
       const models = await ollamaModels(baseUrl, { retries, logger });
       return Math.round(models.reduce((sum, model) => sum + Number(model.size_vram || 0), 0) / MIB);
@@ -86,6 +102,7 @@ function createOllamaBackend({ logger = console } = {}) {
           const response = await fetch(endpoint(baseUrl, 'api/generate'), {
             method: 'POST',
             headers: { 'content-type': 'application/json' },
+            signal: AbortSignal.timeout(10000),
             body: JSON.stringify({ model: model.name ?? model.model, prompt: '', keep_alive: 0 })
           });
           if (!response.ok) throw new Error(`Ollama unload returned ${response.status}`);
@@ -138,7 +155,10 @@ export const BACKENDS = Object.freeze({
 });
 
 export function hasActiveSameBackend(status, labels) {
-  const matches = item => item.preemptible === false && labels.has(item.label);
+  const matches = item => item.preemptible === false && (
+    labels.has(item.label)
+    || (labels.has('llm') && item.label.startsWith('ollama:model:'))
+  );
   return status.leases.some(matches) || status.queue.some(matches);
 }
 
@@ -169,8 +189,10 @@ export function createCustodian({
     lease = null;
     try {
       const status = await client.status();
-      const yieldToSameBackend = hasActiveSameBackend(status, adapter.sameBackendLabels);
-      if (!yieldToSameBackend) await adapter.unload();
+      const shouldUnload = adapter.shouldUnload
+        ? await adapter.shouldUnload(status)
+        : !hasActiveSameBackend(status, adapter.sameBackendLabels);
+      if (shouldUnload) await adapter.unload();
     } finally {
       await current.release();
       evicting = false;
@@ -182,7 +204,15 @@ export function createCustodian({
     const resident = await adapter.queryResidentMib();
     if (resident < minMib) return;
     const status = await client.status();
-    if (hasActiveSameBackend(status, adapter.sameBackendLabels)) return;
+    if (hasActiveSameBackend(status, adapter.sameBackendLabels)) {
+      // A backend request may already be queued behind an incompatible resident
+      // model before the custodian has acquired its cache lease. In that case
+      // there is no lease to preempt, so proactively evict the stale resident.
+      if (adapter.shouldUnload && await adapter.shouldUnload(status)) {
+        await adapter.unload();
+      }
+      return;
+    }
     lease = await client.acquire(resident, {
       preemptible: true,
       adopt: true,

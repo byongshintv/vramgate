@@ -45,6 +45,9 @@ export class VramgateClient {
     this.connectPromise = null;
     this.pending = new Map();
     this.leases = new Map();
+    // A grant and its immediate preempt can arrive in the same socket chunk.
+    // Keep the latter until acquire() has installed the lease callback state.
+    this.earlyPreempts = new Map();
     this.nextId = 1;
   }
 
@@ -81,7 +84,9 @@ export class VramgateClient {
 
   onMessage(message) {
     if (message.type === 'preempt') {
-      this.leases.get(message.leaseId)?.trigger(message);
+      const preemption = this.leases.get(message.leaseId);
+      if (preemption) preemption.trigger(message);
+      else this.earlyPreempts.set(message.leaseId, message);
       return;
     }
     const pending = this.pending.get(message.requestId);
@@ -110,7 +115,10 @@ export class VramgateClient {
     return { requestId, response };
   }
 
-  async acquire(mib, { priority, label = '', timeoutMs = 0, preemptible = false, adopt = false, idleWindowMs = 0 } = {}) {
+  async acquire(mib, {
+    priority, label = '', timeoutMs = 0, preemptible = false, adopt = false,
+    adoptFromLabel = '', idleWindowMs = 0
+  } = {}) {
     mib = Number(mib);
     if (!Number.isInteger(mib) || mib <= 0) throw new TypeError('mib must be a positive integer');
     priority = priority == null ? (preemptible ? -100 : 0) : Number(priority);
@@ -120,6 +128,7 @@ export class VramgateClient {
         type: 'acquire', mib, priority, label,
         preemptible: Boolean(preemptible),
         adopt: Boolean(adopt),
+        adoptFromLabel: String(adoptFromLabel),
         idleWindowMs: Number(idleWindowMs)
       }, ['grant']);
     } catch (error) {
@@ -161,6 +170,11 @@ export class VramgateClient {
       };
       preemption.trigger = preemption.trigger.bind(preemption);
       this.leases.set(lease.leaseId, preemption);
+      const earlyPreempt = this.earlyPreempts.get(lease.leaseId);
+      if (earlyPreempt) {
+        this.earlyPreempts.delete(lease.leaseId);
+        queueMicrotask(() => preemption.trigger(earlyPreempt));
+      }
       return lease;
     } catch (error) {
       this.pending.delete(operation.requestId);
@@ -194,6 +208,7 @@ export class VramgateClient {
   close() {
     this.socket?.end();
     this.socket = null;
+    this.earlyPreempts.clear();
   }
 }
 

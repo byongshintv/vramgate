@@ -63,6 +63,20 @@ test('resident memory above minMib is represented by a preemptible lease', async
   assert.equal(status.leases[0].label, 'cache:custom');
 });
 
+test('incompatible resident is evicted when same-backend demand exists before cache lease', async t => {
+  const context = await setup(t);
+  context.adapter.shouldUnload = async () => true;
+  const llm = new VramgateClient({ socket: context.socket, failOpen: false });
+  t.after(() => llm.close());
+  const lease = await llm.acquire(1024, { label: 'llm' });
+
+  await context.custodian.ensureLease();
+
+  assert.equal(context.unloads, 1);
+  assert.equal(context.custodian.lease, null);
+  await lease.release();
+});
+
 test('adopts already-counted external resident memory without requiring headroom', async t => {
   const directory = await mkdtemp(join(tmpdir(), 'vramgate-custodian-adopt-'));
   const socket = join(directory, 'gate.sock');
@@ -122,6 +136,20 @@ test('same-backend demand yields the cache lease without unloading models', asyn
 
   assert.equal(context.unloads, 0);
   assert.equal(context.custodian.lease, null);
+  await lease.release();
+});
+
+test('model-specific Ollama demand is treated as the same backend', async t => {
+  const context = await setup(t);
+  await context.custodian.ensureLease();
+  const llm = new VramgateClient({ socket: context.socket, failOpen: false });
+  t.after(() => llm.close());
+
+  const waiting = llm.acquire(3072, { label: 'ollama:model:qwen3-opencode:14b' });
+  await waitFor(() => context.custodian.lease === null);
+  const lease = await waiting;
+
+  assert.equal(context.unloads, 0);
   await lease.release();
 });
 
@@ -197,6 +225,31 @@ test('ollama labels default to llm and vlm and can be replaced from env', t => {
   assert.deepEqual(
     BACKENDS.ollama({ logger: null }).sameBackendLabels,
     new Set(['llm', 'embed', 'custom'])
+  );
+});
+
+test('Ollama model-aware preemption reuses equal weights and unloads different weights', async t => {
+  const originalFetch = globalThis.fetch;
+  t.after(() => { globalThis.fetch = originalFetch; });
+  globalThis.fetch = async () => ({
+    ok: true,
+    async json() {
+      return { models: [{ name: 'qwen3-opencode:14b', size_vram: 1024 }] };
+    }
+  });
+  const backend = BACKENDS.ollama({ logger: null });
+  const statusFor = label => ({
+    leases: [],
+    queue: [{ label, preemptible: false }]
+  });
+
+  assert.equal(
+    await backend.shouldUnload(statusFor('ollama:model:qwen3-opencode:14b')),
+    false
+  );
+  assert.equal(
+    await backend.shouldUnload(statusFor('ollama:model:another-model:14b')),
+    true
   );
 });
 

@@ -119,6 +119,75 @@ test('closing a connection releases all of its leases and rescans', async t => {
   await lease.release();
 });
 
+test('immediate preempt delivered with grant is not lost', async t => {
+  const directory = await mkdtemp(join(tmpdir(), 'vramgate-'));
+  const socket = join(directory, 'gate.sock');
+  const daemon = new VramgateDaemon({
+    socket,
+    budget: 4096,
+    reserve: 0,
+    safety: 0,
+    idleThreshold: 1536,
+    poll: 100000,
+    queryFn: async () => ({ used: 0, total: 4096 }),
+    logger: null
+  });
+  await daemon.start();
+  t.after(() => daemon.close());
+  const cache = new VramgateClient({ socket, failOpen: false });
+  const foreground = new VramgateClient({ socket, failOpen: false });
+  t.after(() => cache.close());
+  t.after(() => foreground.close());
+
+  const waiting = foreground.acquire(3072, { label: 'foreground' });
+  const adopted = await cache.acquire(2048, {
+    label: 'cache:test', preemptible: true, adopt: true, priority: -1000
+  });
+  const preempt = await Promise.race([
+    adopted.preempted,
+    new Promise((_, reject) => setTimeout(() => reject(new Error('preempt lost')), 500))
+  ]);
+
+  assert.equal(preempt.leaseId, adopted.leaseId);
+  await adopted.release();
+  const lease = await waiting;
+  await lease.release();
+});
+
+test('cache adoption queues behind an active same-model request', async t => {
+  const directory = await mkdtemp(join(tmpdir(), 'vramgate-'));
+  const socket = join(directory, 'gate.sock');
+  const daemon = new VramgateDaemon({
+    socket, budget: 4096, reserve: 0, safety: 0, idleThreshold: 1536,
+    poll: 100000, queryFn: async () => ({ used: 0, total: 4096 }), logger: null
+  });
+  await daemon.start();
+  t.after(() => daemon.close());
+  const cache = new VramgateClient({ socket, failOpen: false });
+  const first = new VramgateClient({ socket, failOpen: false });
+  const second = new VramgateClient({ socket, failOpen: false });
+  t.after(() => cache.close());
+  t.after(() => first.close());
+  t.after(() => second.close());
+
+  const cached = await cache.acquire(3072, {
+    label: 'cache:ollama', preemptible: true, adopt: true, priority: -1000
+  });
+  const active = await first.acquire(3072, {
+    label: 'ollama:model:qwen:14b', adopt: true, adoptFromLabel: 'cache:ollama'
+  });
+  const waiting = second.acquire(3072, {
+    label: 'ollama:model:qwen:14b', adopt: true, adoptFromLabel: 'cache:ollama'
+  });
+  await new Promise(resolve => setTimeout(resolve, 20));
+  assert.equal(daemon.status().queue.length, 1);
+
+  await cached.release();
+  await active.release();
+  const next = await waiting;
+  await next.release();
+});
+
 test('GPU query failures block new grants after the configured threshold and recover', async t => {
   const context = await setup(t);
   context.daemon.gpuFailureLimit = 2;

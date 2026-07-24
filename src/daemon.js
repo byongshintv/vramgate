@@ -161,10 +161,18 @@ export class VramgateDaemon {
       if (!Number.isInteger(mib) || mib <= 0) {
         return this.send(connection.socket, { type: 'error', requestId, error: 'mib must be a positive integer' });
       }
+      const adoptFromLabel = String(message.adoptFromLabel ?? '');
+      const canAdoptFromCache = adoptFromLabel
+        && [...this.leases.values()].some(lease =>
+          lease.preemptible && lease.label === adoptFromLabel
+        )
+        && ![...this.leases.values()].some(lease =>
+          !lease.preemptible && lease.label.startsWith('ollama:model:')
+        );
       const item = {
         requestId, mib,
         preemptible: message.preemptible === true,
-        adopt: message.adopt === true,
+        adopt: message.adopt === true && (!adoptFromLabel || canAdoptFromCache),
         idleWindowMs: Math.max(0, Number(message.idleWindowMs) || 0),
         priority: Number.isInteger(message.priority) ? message.priority : (message.preemptible === true ? -100 : 0),
         label: String(message.label ?? ''),
@@ -172,6 +180,12 @@ export class VramgateDaemon {
         sequence: this.sequence++,
         connection
       };
+      if (message.adopt === true && adoptFromLabel && !canAdoptFromCache) {
+        this.audit('adopt-denied', {
+          mib: item.mib, label: item.label, priority: item.priority,
+          adoptFromLabel, reason: 'cache-missing-or-active-model'
+        });
+      }
       if (item.adopt) {
         const leaseId = `${process.pid}-${Date.now().toString(36)}-${(++this.leaseSequence).toString(36)}`;
         const lease = {
@@ -198,6 +212,8 @@ export class VramgateDaemon {
       this.audit('queue', {
         mib: item.mib, label: item.label, priority: item.priority,
         preemptible: item.preemptible,
+        adoptRequested: message.adopt === true,
+        adoptFromLabel,
         reason: this.admissionBlocked ? 'gpu-query-unhealthy' : 'capacity-or-idle'
       });
       this.updateBusy();
