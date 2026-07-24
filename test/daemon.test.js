@@ -50,6 +50,22 @@ test('strict admission queues 16G until both 8G leases release', async t => {
   await leaseC.release();
 });
 
+test('a message exceeding the byte cap is rejected and the connection dropped', async t => {
+  const { socket } = await setup(t);
+  const { connect } = await import('node:net');
+  const client = connect(socket);
+  t.after(() => client.destroy());
+  await new Promise((resolve, reject) => {
+    client.once('connect', resolve);
+    client.once('error', reject);
+  });
+  const closed = new Promise(resolve => client.once('close', resolve));
+  // 2 MiB with no newline; default cap is 1 MiB.
+  client.write('x'.repeat(2 * 1024 * 1024));
+  await closed;
+  assert.equal(client.destroyed, true);
+});
+
 test('acquire timeout is fail-closed after a successful connection', async t => {
   const context = await setup(t, { gpu: { used: 16000, total: 17408 } });
   const client = new VramgateClient({ socket: context.socket });

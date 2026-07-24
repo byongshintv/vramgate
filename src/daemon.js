@@ -35,6 +35,7 @@ export class VramgateDaemon {
     this.logger = options.logger === undefined ? console : options.logger;
     this.connectionSequence = 0;
     this.admissionBlocked = false;
+    this.maxMessageBytes = Math.max(1, Number(options.maxMessageBytes ?? 1024 * 1024));
   }
 
   get granted() {
@@ -129,7 +130,15 @@ export class VramgateDaemon {
     };
     const decoder = createDecoder(
       message => this.handleMessage(state, message),
-      error => this.send(socket, { type: 'error', error: `invalid JSON: ${error.message}` })
+      error => this.send(socket, { type: 'error', error: `invalid JSON: ${error.message}` }),
+      {
+        maxBytes: this.maxMessageBytes,
+        onOverflow: error => {
+          this.audit('message-overflow', { connectionId: state.connectionId, error: error.message });
+          this.send(socket, { type: 'error', error: error.message });
+          socket.destroy();
+        }
+      }
     );
     socket.on('data', chunk => decoder.push(chunk));
     const cleanup = () => {
