@@ -1,8 +1,10 @@
 # vramgate
 
-`vramgate`는 단일 NVIDIA GPU를 여러 프로세스가 공유할 때 OOM을 줄이는 협조적 VRAM admission-control 브로커다. Node.js 20 이상만 필요하며 외부 패키지 의존성이 없다.
+*English · [한국어](README.ko.md)*
 
-## 설치와 실행
+`vramgate` is a cooperative VRAM admission-control broker that reduces out-of-memory failures when several processes share a single NVIDIA GPU. It needs only Node.js 20+ and has no external package dependencies.
+
+## Install and run
 
 ```sh
 npm install
@@ -10,7 +12,7 @@ node bin/vramgate daemon
 node bin/vramgate status
 ```
 
-기본 소켓은 `${XDG_RUNTIME_DIR:-/run/user/$UID}/vramgate.sock`이다. 사용자 systemd 서비스는 `systemd/vramgate.service`를 적절한 사용자 유닛 경로에 복사한 뒤 `systemctl --user enable --now vramgate`로 실행할 수 있다.
+The default socket path is `${XDG_RUNTIME_DIR:-/run/user/$UID}/vramgate.sock`. To run it as a systemd user service, copy `systemd/vramgate.service` into a user unit path and start it with `systemctl --user enable --now vramgate`.
 
 ```sh
 vramgate daemon --budget 15360 --reserve 1024 --safety 512 --idle-threshold 1536
@@ -20,16 +22,18 @@ vramgate hold --vram 8G --label gaming
 vramgate status --json
 ```
 
-`run`은 리스를 받은 뒤 명령을 실행하고 자식의 종료 코드를 그대로 전달한다. `hold`는 Ctrl-C까지 예약을 유지한다. `idle-run`은 지정 시간 동안 GPU가 유휴이면 저우선순위 작업을 실행한다. 일반 요청이 오면 자식에 SIGTERM을 보내고(기본 30초 뒤 SIGKILL) 리스를 해제한 뒤 유휴 상태를 기다려 재시작한다. 자식이 스스로 끝나면 그 종료 코드로 종료한다. 체크포인트 저장·재개는 자식 프로그램 책임이다.
+- `run` — acquires a lease, runs the command, and forwards the child's exit code.
+- `hold` — keeps the reservation until you press Ctrl-C.
+- `idle-run` — runs a low-priority job while the GPU has been idle for the given window. When a regular request arrives, it sends SIGTERM to the child (then SIGKILL after 30s by default), releases the lease, waits for the GPU to go idle again, and restarts. If the child exits on its own, it exits with that code. Saving and resuming from checkpoints is the child program's responsibility.
 
-## Node 클라이언트
+## Node client
 
 ```js
 import { VramBusyError, VramgateClient } from 'vramgate';
 
 const client = new VramgateClient({ socket: process.env.VRAMGATE_SOCKET });
 await client.withLease(8 * 1024, { label: 'sdxl', priority: 0 }, async () => {
-  // GPU 작업
+  // GPU work
 });
 
 const training = await client.acquire(12 * 1024, {
@@ -37,53 +41,56 @@ const training = await client.acquire(12 * 1024, {
   idleWindowMs: 5 * 60_000
 });
 training.onPreempt(() => stopTraining());
-await training.preempted; // 콜백 대신 Promise로도 대기 가능
+await training.preempted; // can also await the Promise instead of the callback
 ```
 
-`acquire(mib, options)`, `status()`, `withLease(mib, options, fn)`를 제공한다. 연결 자체가 실패하면 기본 `failOpen: true`에 따라 no-op 리스를 반환한다. 연결 후 큐 대기는 `timeoutMs`가 없거나 0이면 무기한이고, 양수이면 만료 시 fail-open하지 않고 `VramBusyError`를 던진다. `withLease`에도 같은 정책이 적용된다.
+The client exposes `acquire(mib, options)`, `status()`, and `withLease(mib, options, fn)`. If the connection itself fails, it returns a no-op lease according to the default `failOpen: true`. Once connected, queue waiting is indefinite when `timeoutMs` is unset or 0; a positive value throws `VramBusyError` on expiry instead of failing open. The same policy applies to `withLease`.
 
-## 아키텍처
+## Architecture
 
-데몬은 Unix 소켓의 NDJSON 프로토콜로 요청을 받고 가중 카운팅 세마포어를 관리한다. 우선순위가 높은 요청부터, 같은 우선순위에서는 FIFO로 처리한다. 같은 연결에서 얻은 모든 리스는 그 연결이 닫힐 때 자동 해제된다.
+The daemon accepts requests over an NDJSON protocol on a Unix socket and manages a weighted counting semaphore. Higher-priority requests are served first, and requests at the same priority are served FIFO. Every lease obtained on a connection is released automatically when that connection closes.
 
-`nvidia-smi`의 실측 사용량에서 활성 관리 리스를 뺀 값을 external 사용량으로 본다. 신규 요청은 관리 리스, external 사용량, 요청 비용과 안전 마진의 합이 물리 VRAM 상한 이내일 때만 승인한다.
+External usage is defined as the measured `nvidia-smi` usage minus the active managed leases. A new request is admitted only when the sum of managed leases, external usage, the request cost, and the safety margin stays within the physical VRAM limit.
 
-GPU 조회는 마지막 정상 실측값을 짧게 재사용하되 기본 3회 연속 실패하면 신규 리스 승인을 중단한다. 정상 실측이 돌아오면 대기열 처리를 자동 재개한다. 임계값은 `--gpu-failure-limit` 또는 `VRAMGATE_GPU_FAILURE_LIMIT`로 바꿀 수 있다. 정상 실측을 한 번도 얻지 못한 시작 상태에서는 즉시 승인을 차단한다.
+GPU queries reuse the last good measurement briefly, but after 3 consecutive failures (the default) new-lease admission is halted. Admission resumes automatically once a good measurement returns. The threshold can be changed with `--gpu-failure-limit` or `VRAMGATE_GPU_FAILURE_LIMIT`. At startup, before any good measurement has been obtained, admission is blocked immediately.
 
-busy는 비선점 활성 리스나 대기 요청이 있거나 external이 `--idle-threshold`(기본 1536 MiB)를 넘을 때 참이다. 선점형 리스는 VRAM 조건과 `idleWindowMs` 동안 유휴였다는 조건을 모두 만족해야 승인된다. 이후 busy가 되면 데몬은 클라이언트에 `preempt` 이벤트만 보내고 프로세스를 직접 종료하지 않는다. `status`에는 `busy`, `lastBusyAt`, `idleThreshold`와 리스/큐의 선점형 정보가 포함된다.
+`busy` is true when there is a non-preemptible active lease or a queued request, or when external usage exceeds `--idle-threshold` (default 1536 MiB). A preemptible lease is admitted only when both the VRAM condition and the "idle for `idleWindowMs`" condition are met. If the system becomes busy afterward, the daemon only sends a `preempt` event to the client — it never terminates the process directly. `status` includes `busy`, `lastBusyAt`, `idleThreshold`, and the preemptible details of each lease and queue entry.
 
-## 운영 감사 로그
+## Operational audit log
 
-데몬은 `queue`, `grant`, `release`, `cancel`, `preempt`, GPU 조회 차단·복구 이벤트를 `vramgate:audit` 접두사의 한 줄 JSON으로 표준 출력에 기록한다. systemd 환경에서는 다음처럼 조회할 수 있다.
+The daemon logs `queue`, `grant`, `release`, `cancel`, `preempt`, and GPU-query halt/recover events to standard output as one-line JSON prefixed with `vramgate:audit`. Under systemd you can query them with:
 
 ```sh
 journalctl --user -u vramgate -g 'vramgate:audit'
 ```
 
-리스 로그에는 label·MiB·우선순위·대기시간·보유시간·해제 사유가 포함되므로 작동 횟수와 병목을 사후 집계할 수 있다.
+Each lease log carries the label, MiB, priority, wait time, hold time, and release reason, so you can tally activity and bottlenecks after the fact.
 
-## 수동 ComfyUI/게임 스트리밍 운용
+## Manual ComfyUI / game-streaming use
 
-ComfyUI처럼 직접 실행하는 프로그램도 래퍼로 예약할 수 있다.
+Programs you launch directly, such as ComfyUI, can also be reserved through the wrapper.
 
 ```sh
 vramgate run --vram 10G --label comfyui -- python main.py
 vramgate run --vram 8G --label game-stream -- ./start-game.sh
 ```
 
-게임을 별도 런처에서 실행해야 한다면 먼저 `vramgate hold --vram 8G --label gaming`으로 공간을 잡고, 종료 후 Ctrl-C로 해제한다. 프로그램을 vramgate로 감싸지 않아도 `nvidia-smi` 실측분이 external로 계산되므로 대기 중인 관리 작업은 자동으로 이를 피한다. 단, vramgate는 비선점 방식이라 이미 실행 중인 관리 작업이나 게임을 중단하거나 VRAM을 회수하지는 않는다.
-
-## 향후 작업
-
-- TODO: strict priority/FIFO의 head-of-line blocking을 완화하는 안전한 backfill 정책.
+If a game must be launched from a separate launcher, reserve the space first with `vramgate hold --vram 8G --label gaming` and release it with Ctrl-C after quitting. Even when a program is not wrapped by vramgate, its measured `nvidia-smi` usage counts as external, so pending managed jobs automatically steer around it. Note that vramgate is non-preemptive: it will not stop or reclaim VRAM from an already-running managed job or game.
 
 ## Custodian
 
-Custodian은 Ollama 또는 ComfyUI의 상주 idle 모델 VRAM을 선점 가능한 캐시 리스로 등록하고, 다른 작업이 공간을 요구하면 모델을 언로드해 VRAM을 회수한다.
-`systemctl --user enable --now vramgate-custodian@ollama` 또는
-`systemctl --user enable --now vramgate-custodian@comfyui`로 백엔드별 서비스를 활성화할 수 있다.
+Custodian registers the resident model VRAM that Ollama or ComfyUI holds while idle as a preemptible cache lease, then unloads the model to reclaim VRAM when another job needs the space. Enable the per-backend services with:
 
-## 테스트
+```sh
+systemctl --user enable --now vramgate-custodian@ollama
+systemctl --user enable --now vramgate-custodian@comfyui
+```
+
+## Roadmap
+
+- TODO: a safe backfill policy that relaxes head-of-line blocking under strict priority/FIFO.
+
+## Tests
 
 ```sh
 npm test
