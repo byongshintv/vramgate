@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtemp } from 'node:fs/promises';
+import { mkdtemp, stat } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { VramgateDaemon } from '../src/daemon.js';
@@ -48,6 +48,12 @@ test('strict admission queues 16G until both 8G leases release', async t => {
   const leaseC = await waitingC;
   assert.equal(leaseC.mib, 16384);
   await leaseC.release();
+});
+
+test('listening socket is created with owner-only permissions', async t => {
+  const { socket } = await setup(t);
+  const info = await stat(socket);
+  assert.equal(info.mode & 0o777, 0o600);
 });
 
 test('a message exceeding the byte cap is rejected and the connection dropped', async t => {

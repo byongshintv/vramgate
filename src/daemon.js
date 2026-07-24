@@ -1,5 +1,5 @@
 import net from 'node:net';
-import { unlink } from 'node:fs/promises';
+import { unlink, chmod } from 'node:fs/promises';
 import { createGpuQuery } from './gpu.js';
 import { createDecoder, encodeMessage } from './protocol.js';
 
@@ -97,6 +97,10 @@ export class VramgateDaemon {
         this.server.off('error', onError);
         resolve();
       });
+    });
+    // Restrict the socket to the owner; matters when --socket points outside /run/user.
+    await chmod(this.socket, 0o600).catch(error => {
+      if (error.code !== 'ENOENT') throw error;
     });
     this.timer = setInterval(() => void this.poll(), this.pollMs);
     this.timer.unref?.();
