@@ -88,7 +88,9 @@ systemctl --user enable --now vramgate-custodian@comfyui
 
 ## 향후 작업
 
-- TODO: strict priority/FIFO의 head-of-line blocking을 완화하는 안전한 backfill 정책.
+- Backfill은 의도적으로 보류합니다. 리스 실행시간 상한이나 강제 선점이 없는 상태에서
+  뒤의 작은 요청을 먼저 승인하면 선두 요청을 오히려 지연시켜 priority/FIFO를 깨뜨릴 수
+  있습니다. 안전하게 구현하기 위한 선행 조건은 `DESIGN.md`에 정리했습니다.
 
 ## 테스트
 

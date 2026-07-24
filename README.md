@@ -88,7 +88,9 @@ systemctl --user enable --now vramgate-custodian@comfyui
 
 ## Roadmap
 
-- TODO: a safe backfill policy that relaxes head-of-line blocking under strict priority/FIFO.
+- Backfill remains deliberately deferred. Without bounded lease runtimes or enforceable
+  preemption, admitting a smaller request behind a blocked head can delay that head and
+  violate priority/FIFO. See `DESIGN.md` for the prerequisites of a safe implementation.
 
 ## Tests
 
